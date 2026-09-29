@@ -2,7 +2,7 @@
 """
 usb_forward.py - reach the Phone Proxy app over the USB cable, no hotspot.
 
-Listens on 127.0.0.1:1080 on the PC and tunnels each connection through
+Listens on 127.0.0.1:8180 on the PC and tunnels each connection through
 Apple's USB multiplexer (the "Apple Mobile Device Service" that iTunes /
 Apple Devices installs) to the proxy port on the iPhone.
 
@@ -10,9 +10,9 @@ With Personal Hotspot OFF, the PC has no route to the internet except
 through this tunnel, so nothing can leak out as hotspot data.
 
 Usage:
-    python pc/usb_forward.py                 # PC 127.0.0.1:1080 -> phone :1080
-    python pc/usb_forward.py --port 8888     # the port set in the app
-    python pc/usb_forward.py --local-port 1081
+    python pc/usb_forward.py --system-proxy  # forward :8180 and manage the Windows proxy
+    python pc/usb_forward.py --port 1080     # the port set in the app
+    python pc/usb_forward.py                 # forward only; point apps at 127.0.0.1:8180
 """
 
 import argparse
@@ -21,6 +21,7 @@ import plistlib
 import socket
 import struct
 import sys
+import threading
 import time
 
 USBMUX = ("127.0.0.1", 27015)
@@ -41,6 +42,10 @@ class UsbmuxError(Exception):
 def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
 
+
+# --------------------------------------------------------------------------- #
+# usbmux (Apple Mobile Device Service)
+# --------------------------------------------------------------------------- #
 
 async def usbmux_request(reader, writer, message, tag):
     """Send one plist message to usbmuxd and return its plist reply."""
@@ -102,72 +107,206 @@ async def pipe(reader, writer):
 
 
 class Forwarder:
+    """Accepts local connections and tunnels each one to the phone over USB."""
+
     def __init__(self, phone_port):
         self.phone_port = phone_port
         self.device_id = None
-        self.last_error = None
+        self.serial = None
+        self.app_up = False
 
-    async def connect(self):
-        if self.device_id is None:
-            self.device_id, _ = await find_device()
+    async def status(self):
+        """'no-device', 'no-app' or 'ready'. Cheap enough to poll every few
+        seconds: it only test-connects to the app when something changed."""
         try:
-            return await open_phone_port(self.device_id, self.phone_port)
-        except UsbmuxError:
-            # The phone may have been re-plugged and got a new device ID.
-            self.device_id, _ = await find_device()
-            return await open_phone_port(self.device_id, self.phone_port)
+            device_id, self.serial = await find_device()
+        except (UsbmuxError, OSError):
+            self.device_id, self.app_up = None, False
+            return "no-device"
+        if device_id != self.device_id or not self.app_up:
+            self.device_id = device_id
+            try:
+                _, w = await open_phone_port(device_id, self.phone_port)
+                w.close()
+                self.app_up = True
+            except (UsbmuxError, OSError):
+                self.app_up = False
+        return "ready" if self.app_up else "no-app"
 
     async def handle(self, c_reader, c_writer):
         try:
-            p_reader, p_writer = await self.connect()
-        except (UsbmuxError, OSError) as e:
-            if str(e) != self.last_error:  # don't spam the same error per connection
-                log("can't reach phone: %s" % e)
-                self.last_error = str(e)
+            if self.device_id is None:
+                raise UsbmuxError("iPhone not connected")
+            p_reader, p_writer = await open_phone_port(self.device_id, self.phone_port)
+        except (UsbmuxError, OSError):
+            self.app_up = False  # the watcher re-checks and reports what's wrong
             c_writer.close()
             return
-        if self.last_error:
-            log("phone reachable again")
-            self.last_error = None
         await asyncio.gather(pipe(c_reader, p_writer), pipe(p_reader, c_writer))
 
 
-async def main():
-    ap = argparse.ArgumentParser(description="Forward a PC port to Phone Proxy over USB")
-    ap.add_argument("--port", type=int, default=1080, help="proxy port set in the iPhone app")
+# --------------------------------------------------------------------------- #
+# Windows system proxy
+# --------------------------------------------------------------------------- #
+
+class WindowsProxy:
+    """Points the Windows system proxy at the forwarder, and puts the user's
+    original settings back afterwards."""
+
+    KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    NAMES = ("ProxyEnable", "ProxyServer", "ProxyOverride")
+    BYPASS = "localhost;127.*;10.*;192.168.*;<local>"
+
+    def __init__(self, address):
+        import winreg
+        self.winreg = winreg
+        self.address = address
+        self.active = False
+        self.lock = threading.Lock()
+        self.saved = self._read()
+        # A previous run that was killed may have left our setting behind;
+        # don't "restore" that.
+        if self.saved["ProxyServer"] and self.saved["ProxyServer"][0] == address:
+            self.saved["ProxyEnable"] = (0, winreg.REG_DWORD)
+
+    def _read(self):
+        wr = self.winreg
+        values = {}
+        with wr.OpenKey(wr.HKEY_CURRENT_USER, self.KEY) as key:
+            for name in self.NAMES:
+                try:
+                    values[name] = wr.QueryValueEx(key, name)
+                except FileNotFoundError:
+                    values[name] = None
+        return values
+
+    def _write(self, values):
+        wr = self.winreg
+        with wr.OpenKey(wr.HKEY_CURRENT_USER, self.KEY, 0, wr.KEY_SET_VALUE) as key:
+            for name, value in values.items():
+                if value is None:
+                    try:
+                        wr.DeleteValue(key, name)
+                    except FileNotFoundError:
+                        pass
+                else:
+                    wr.SetValueEx(key, name, 0, value[1], value[0])
+        # Tell running apps the settings changed (SETTINGS_CHANGED, REFRESH).
+        import ctypes
+        ctypes.windll.wininet.InternetSetOptionW(None, 39, None, 0)
+        ctypes.windll.wininet.InternetSetOptionW(None, 37, None, 0)
+
+    def enable(self):
+        wr = self.winreg
+        with self.lock:
+            if self.active:
+                return
+            self._write({
+                "ProxyServer": (self.address, wr.REG_SZ),
+                "ProxyOverride": (self.BYPASS, wr.REG_SZ),
+                "ProxyEnable": (1, wr.REG_DWORD),
+            })
+            self.active = True
+
+    def restore(self):
+        with self.lock:
+            if not self.active:
+                return
+            self._write(self.saved)
+            self.active = False
+
+
+def on_console_close(callback):
+    """Run `callback` if the console window is closed or Windows logs off /
+    shuts down. (Ctrl+C arrives as KeyboardInterrupt instead.)"""
+    import ctypes
+    from ctypes import wintypes
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    def handler(event):
+        if event in (2, 5, 6):  # CLOSE, LOGOFF, SHUTDOWN
+            callback()
+        return False
+
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True)
+    return handler  # caller must keep a reference, or it gets garbage-collected
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+async def watch(fwd, proxy, interval=3):
+    last = None
+    while True:
+        state = await fwd.status()
+        if state != last:
+            if state == "ready":
+                log("Ready: iPhone (%s) is proxying on port %d." % (fwd.serial, fwd.phone_port))
+            elif state == "no-app":
+                log("iPhone connected, but Phone Proxy isn't answering on port %d. "
+                    "Start it in the app." % fwd.phone_port)
+            else:
+                log("Waiting for the iPhone on USB (plug it in, unlock it, tap Trust)...")
+            if proxy:
+                if state == "ready":
+                    proxy.enable()
+                    log("Windows proxy ON  -> %s" % proxy.address)
+                elif proxy.active:
+                    proxy.restore()
+                    log("Windows proxy OFF (restored your previous settings)")
+            last = state
+        await asyncio.sleep(interval)
+
+
+async def run(args):
+    local_port = args.local_port or args.port
+    fwd = Forwarder(args.port)
+    try:
+        server = await asyncio.start_server(fwd.handle, args.listen, local_port, limit=BUF)
+    except OSError as e:
+        sys.exit("Can't listen on %s:%d (%s). Is another copy already running?"
+                 % (args.listen, local_port, e.strerror or e))
+
+    proxy = None
+    close_handler = None
+    if args.system_proxy:
+        proxy = WindowsProxy("127.0.0.1:%d" % local_port)
+        close_handler = on_console_close(proxy.restore)
+
+    log("Forwarding %s:%d -> iPhone:%d over USB. Press Ctrl+C to stop."
+        % (args.listen, local_port, args.port))
+    if not proxy:
+        log("Point your apps at 127.0.0.1:%d (SOCKS5 or HTTP)." % local_port)
+    try:
+        await watch(fwd, proxy)
+    finally:
+        # Restore first, and don't wait for open connections to drain:
+        # browsers keep idle keep-alive connections open indefinitely.
+        if proxy and proxy.active:
+            proxy.restore()
+            log("Windows proxy OFF (restored your previous settings)")
+        server.close()
+        del close_handler
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Use Phone Proxy over USB, without the hotspot")
+    ap.add_argument("--port", type=int, default=8180,
+                    help="proxy port set in the iPhone app (default 8180)")
     ap.add_argument("--local-port", type=int, help="port on this PC (default: same as --port)")
     ap.add_argument("--listen", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
+    ap.add_argument("--system-proxy", action="store_true",
+                    help="turn the Windows system proxy on while the phone is ready, "
+                         "and restore the previous settings on exit")
     args = ap.parse_args()
-    local_port = args.local_port or args.port
-
+    if args.system_proxy and sys.platform != "win32":
+        sys.exit("--system-proxy only works on Windows")
     try:
-        device_id, serial = await find_device()
-    except UsbmuxError as e:
-        sys.exit(str(e))
-    log("iPhone found over USB (%s)" % serial)
-
-    try:
-        _, w = await open_phone_port(device_id, args.port)
-        w.close()
-        log("Phone Proxy is answering on port %d" % args.port)
-    except UsbmuxError as e:
-        log("warning: %s" % e)
-        log("starting anyway; connections will work once the app's proxy is running")
-
-    fwd = Forwarder(args.port)
-    fwd.device_id = device_id
-    server = await asyncio.start_server(fwd.handle, args.listen, local_port, limit=BUF)
-    log("Forwarding %s:%d -> iPhone:%d over USB. Ctrl+C to stop."
-        % (args.listen, local_port, args.port))
-    log("Point the PC at %s:%d  (e.g. .\\pc\\set-proxy.ps1 -Address 127.0.0.1 -Port %d)"
-        % ("127.0.0.1" if args.listen in ("0.0.0.0", "127.0.0.1") else args.listen,
-           local_port, local_port))
-    async with server:
-        await server.serve_forever()
+        asyncio.run(run(args))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    main()

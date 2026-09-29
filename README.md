@@ -91,16 +91,14 @@ That includes Windows DNS lookups, background updates, and apps that ignore the 
 
 1. Turn **Personal Hotspot off** and plug in the iPhone.
 2. In the app, start the proxy and note its port, for example `8180`.
-3. On the PC, start the USB forwarder and leave it running:
-   ```powershell
-   python pc\usb_forward.py --port 8180
-   ```
-4. In a second terminal, point Windows at the forwarder:
-   ```powershell
-   .\pc\set-proxy.ps1 -Address 127.0.0.1 -Port 8180 -Test   # should show the phone's IP
-   .\pc\set-proxy.ps1 -Address 127.0.0.1 -Port 8180         # system proxy on
-   .\pc\set-proxy.ps1 -Off                                  # when done
-   ```
+3. On the PC, double-click **`Phone Proxy.bat`** and leave the window open.
+   If the app uses a port other than 8180, edit the `PORT` line in the file first.
+   - It turns the Windows system proxy **on** when the phone is plugged in and the app's proxy is running.
+     It turns it **off** again if you unplug the phone or stop the app.
+   - When you close the window or press Ctrl+C, your original proxy settings are restored.
+
+   The same thing from a terminal: `python pc\usb_forward.py --port 8180 --system-proxy`.
+   Leave off `--system-proxy` to only forward the port and set up your apps yourself.
 
 Windows will show "No internet" on the network icon. That's expected: apps that use the proxy work, and anything that ignores the proxy is blocked instead of leaking.
 To get those other apps working too, point Proxifier or sing-box at `127.0.0.1:8180` (SOCKS5).
