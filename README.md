@@ -82,7 +82,30 @@ After the app is running, continue at **step 2** below. The PC side is the same 
 > Other iOS apps work too: **a-Shell** has Python built in, and **Pythonista** is paid.
 > But iOS suspends them after a few minutes in the background. iSH's location trick is what keeps it alive.
 
-## 2. Connect the PC
+## USB mode: no hotspot at all (recommended)
+
+In this mode, Personal Hotspot is off and the PC reaches the app over the USB cable.
+It uses the Apple Mobile Device Service that iTunes / Apple Devices installs.
+The PC has no route to the internet except through the proxy, so nothing can go out as hotspot data.
+That includes Windows DNS lookups, background updates, and apps that ignore the proxy.
+
+1. Turn **Personal Hotspot off** and plug in the iPhone.
+2. In the app, start the proxy and note its port, for example `8180`.
+3. On the PC, start the USB forwarder and leave it running:
+   ```powershell
+   python pc\usb_forward.py --port 8180
+   ```
+4. In a second terminal, point Windows at the forwarder:
+   ```powershell
+   .\pc\set-proxy.ps1 -Address 127.0.0.1 -Port 8180 -Test   # should show the phone's IP
+   .\pc\set-proxy.ps1 -Address 127.0.0.1 -Port 8180         # system proxy on
+   .\pc\set-proxy.ps1 -Off                                  # when done
+   ```
+
+Windows will show "No internet" on the network icon. That's expected: apps that use the proxy work, and anything that ignores the proxy is blocked instead of leaking.
+To get those other apps working too, point Proxifier or sing-box at `127.0.0.1:8180` (SOCKS5).
+
+## 2. Connect the PC (hotspot mode)
 
 The PC has to be on the phone's network. Use one of these:
 - **Wi-Fi:** join the iPhone's Personal Hotspot.

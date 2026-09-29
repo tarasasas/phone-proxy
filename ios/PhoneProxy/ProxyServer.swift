@@ -26,8 +26,8 @@ final class ProxyServer {
             switch state {
             case .ready:
                 onState(.running)
-            case .failed(let error):
-                onState(.failed(error.localizedDescription))
+            case .failed(let error), .waiting(let error):
+                onState(.failed(Self.describe(error, port: config.port)))
                 listener?.cancel()
             default:
                 break
@@ -63,6 +63,13 @@ final class ProxyServer {
 
         listener?.cancel()
         open.forEach { $0.cancel() }  // sessions notice and close their remote side
+    }
+
+    private static func describe(_ error: NWError, port: UInt16) -> String {
+        if case .posix(.EADDRINUSE) = error {
+            return "Port \(port) is already used by another app (often a VPN or proxy app). Pick a different port."
+        }
+        return error.localizedDescription
     }
 
     private func track(_ conn: NWConnection) {

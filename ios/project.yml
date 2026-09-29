@@ -2,7 +2,7 @@
 # The CI workflow does that on a macOS runner, so no .xcodeproj is committed.
 name: PhoneProxy
 options:
-  bundleIdPrefix: com.phoneproxy
+  bundleIdPrefix: com.tarasasas
   deploymentTarget:
     iOS: "16.0"
 settings:
@@ -18,7 +18,7 @@ targets:
       - PhoneProxy
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.phoneproxy.app
+        PRODUCT_BUNDLE_IDENTIFIER: com.tarasasas.phoneproxy
         TARGETED_DEVICE_FAMILY: "1,2"
     info:
       path: Info.plist
