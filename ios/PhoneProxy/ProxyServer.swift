@@ -18,7 +18,7 @@ final class ProxyServer {
         guard config.port != 0, let port = NWEndpoint.Port(rawValue: config.port) else {
             throw ProxyError.protocolError("Invalid port")
         }
-        let params = NWParameters.tcp
+        let params = NWParameters.lowLatencyTCP()  // accepted connections inherit these
         params.allowLocalEndpointReuse = true
         let listener = try NWListener(using: params, on: port)
 

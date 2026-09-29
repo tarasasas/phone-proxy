@@ -7,6 +7,18 @@ enum ProxyError: Error {
     case protocolError(String)
 }
 
+extension NWParameters {
+    /// TCP tuned for latency. A proxy relays lots of small writes (TLS
+    /// handshakes, requests); with Nagle + delayed/stretched ACKs each one
+    /// can stall for up to ~200 ms waiting on the previous segment's ACK.
+    static func lowLatencyTCP() -> NWParameters {
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        tcp.disableAckStretching = true
+        return NWParameters(tls: nil, tcp: tcp)
+    }
+}
+
 /// Fires exactly once, so a continuation is never resumed twice.
 final class Once {
     private let lock = NSLock()
@@ -121,7 +133,7 @@ final class Channel {
         guard let nwPort = NWEndpoint.Port(rawValue: port), port != 0 else {
             throw ProxyError.protocolError("invalid port")
         }
-        let params = NWParameters.tcp
+        let params = NWParameters.lowLatencyTCP()
         if cellularOnly { params.requiredInterfaceType = .cellular }
         let conn = NWConnection(host: host, port: nwPort, using: params)
 
