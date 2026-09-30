@@ -1,0 +1,13 @@
+{
+  "logLevel": "Error",
+  "bypassLan": true,
+  "proxies": [
+    {
+      "appNames": ["steam.exe"],
+      "socks5ProxyEndpoint": "127.0.0.1:8180",
+      "socks5Transport": "TCP",
+      "supportedProtocols": ["TCP"],
+      "supportedAddressFamilies": ["IPv4"]
+    }
+  ]
+}

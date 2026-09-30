@@ -17,10 +17,15 @@ Usage:
 
 import argparse
 import asyncio
+import json
+import os
 import plistlib
+import signal
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -155,12 +160,13 @@ class WindowsProxy:
 
     KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     NAMES = ("ProxyEnable", "ProxyServer", "ProxyOverride")
-    BYPASS = "localhost;127.*;10.*;192.168.*;<local>"
+    LOCAL = ["localhost", "127.*", "10.*", "192.168.*", "<local>"]
 
-    def __init__(self, address):
+    def __init__(self, address, extra_bypass=()):
         import winreg
         self.winreg = winreg
         self.address = address
+        self.bypass = ";".join(list(extra_bypass) + self.LOCAL)  # <local> must be last
         self.active = False
         self.lock = threading.Lock()
         self.saved = self._read()
@@ -203,7 +209,7 @@ class WindowsProxy:
                 return
             self._write({
                 "ProxyServer": (self.address, wr.REG_SZ),
-                "ProxyOverride": (self.BYPASS, wr.REG_SZ),
+                "ProxyOverride": (self.bypass, wr.REG_SZ),
                 "ProxyEnable": (1, wr.REG_DWORD),
             })
             self.active = True
@@ -214,6 +220,95 @@ class WindowsProxy:
                 return
             self._write(self.saved)
             self.active = False
+
+
+class ProxiFyre:
+    """Runs ProxiFyre.exe (per-app SOCKS redirector) as a console child
+    process while the phone is ready. Its Windows service times out on start
+    on some PCs, but the console mode works, and this way it can never be
+    left running without the phone. Needs an elevated (admin) launcher."""
+
+    name = "ProxiFyre"
+    DEFAULT_EXE = r"C:\Program Files\ProxiFyre\ProxiFyre.exe"
+
+    def __init__(self, exe, port):
+        self.exe = exe or self.DEFAULT_EXE
+        self.port = port
+        self.proc = None
+        self.log_path = os.path.join(tempfile.gettempdir(), "proxifyre-console.log")
+        self.available = os.path.exists(self.exe)
+        if self.available:
+            self._ensure_config()
+
+    def _ensure_config(self):
+        """ProxiFyre won't start without app-config.json next to its exe.
+        Install ours (steam.exe -> this forwarder) the first time; never
+        overwrite one the user edited, just warn if it points elsewhere."""
+        target = os.path.join(os.path.dirname(self.exe), "app-config.json")
+        endpoint = "127.0.0.1:%d" % self.port
+        if os.path.exists(target):
+            with open(target, encoding="utf-8-sig") as f:
+                if endpoint not in f.read():
+                    log("warning: %s doesn't point at %s; apps it redirects won't reach the phone."
+                        % (target, endpoint))
+            return
+        template = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxifyre-app-config.json")
+        with open(template, encoding="utf-8") as f:
+            config = json.load(f)
+        for rule in config["proxies"]:
+            rule["socks5ProxyEndpoint"] = endpoint
+        try:
+            with open(target, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+            log("Installed ProxiFyre config: steam.exe -> %s" % endpoint)
+        except PermissionError:
+            log("warning: no permission to write %s (run as administrator)." % target)
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def last_output(self):
+        try:
+            with open(self.log_path, encoding="utf-8", errors="replace") as f:
+                lines = [l.strip() for l in f if l.strip()]
+            return lines[-1] if lines else "no output"
+        except OSError:
+            return "no output"
+
+    def set(self, on):
+        """Start or stop ProxiFyre. Returns (changed, error message or None)."""
+        if not self.available or self.running() == on:
+            return False, None
+        if on:
+            out = open(self.log_path, "w", encoding="utf-8")
+            # Own process group: our Ctrl+C doesn't hit it, but CTRL_BREAK can
+            # stop it cleanly. Shares our console, so closing the window ends it.
+            self.proc = subprocess.Popen(
+                [self.exe], cwd=os.path.dirname(self.exe), stdin=subprocess.DEVNULL,
+                stdout=out, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            out.close()
+            try:
+                self.proc.wait(timeout=4)  # a startup failure exits quickly
+                self.proc = None
+                return False, "exited at startup: %s (log: %s)" % (self.last_output(), self.log_path)
+            except subprocess.TimeoutExpired:
+                return True, None
+        try:
+            self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+            self.proc.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+            self.proc.wait(timeout=5)
+        self.proc = None
+        return True, None
+
+    def died(self):
+        """True once if ProxiFyre exited on its own while it should be running."""
+        if self.proc is not None and self.proc.poll() is not None:
+            self.proc = None
+            return True
+        return False
 
 
 def on_console_close(callback):
@@ -236,7 +331,37 @@ def on_console_close(callback):
 # Main
 # --------------------------------------------------------------------------- #
 
-async def watch(fwd, proxy, interval=3):
+class Switches:
+    """Everything that should be on only while the phone is ready: the
+    Windows proxy setting and, optionally, ProxiFyre."""
+
+    def __init__(self, proxy, redirector):
+        self.proxy = proxy
+        self.redirector = redirector
+        self.lock = threading.Lock()
+
+    def set(self, on):
+        with self.lock:
+            if self.proxy:
+                if on and not self.proxy.active:
+                    self.proxy.enable()
+                    log("Windows proxy ON  -> %s" % self.proxy.address)
+                elif not on and self.proxy.active:
+                    self.proxy.restore()
+                    log("Windows proxy OFF (restored your previous settings)")
+            if self.redirector:
+                changed, error = self.redirector.set(on)
+                if error:
+                    log("couldn't %s %s: %s" % ("start" if on else "stop", self.redirector.name, error))
+                elif changed:
+                    log("%s %s" % (self.redirector.name,
+                                   "ON  (apps it redirects now use the phone)" if on else "OFF"))
+
+    def off(self):
+        self.set(False)
+
+
+async def watch(fwd, switches, interval=3):
     last = None
     while True:
         state = await fwd.status()
@@ -248,18 +373,26 @@ async def watch(fwd, proxy, interval=3):
                     "Start it in the app." % fwd.phone_port)
             else:
                 log("Waiting for the iPhone on USB (plug it in, unlock it, tap Trust)...")
-            if proxy:
-                if state == "ready":
-                    proxy.enable()
-                    log("Windows proxy ON  -> %s" % proxy.address)
-                elif proxy.active:
-                    proxy.restore()
-                    log("Windows proxy OFF (restored your previous settings)")
+            # sc.exe can take a moment; keep the event loop (and traffic) moving.
+            await asyncio.to_thread(switches.set, state == "ready")
             last = state
+        elif switches.redirector and switches.redirector.died():
+            log("%s stopped unexpectedly: %s. Restart the launcher to try again."
+                % (switches.redirector.name, switches.redirector.last_output()))
         await asyncio.sleep(interval)
 
 
+def quiet_resets(loop, context):
+    """Windows' proactor loop logs a traceback whenever it tidies up a socket
+    the peer already reset (a closed tab, Steam dropping a connection). That's
+    normal for a proxy; don't print it. Anything else is still reported."""
+    if isinstance(context.get("exception"), (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        return
+    loop.default_exception_handler(context)
+
+
 async def run(args):
+    asyncio.get_running_loop().set_exception_handler(quiet_resets)
     local_port = args.local_port or args.port
     fwd = Forwarder(args.port)
     try:
@@ -268,24 +401,28 @@ async def run(args):
         sys.exit("Can't listen on %s:%d (%s). Is another copy already running?"
                  % (args.listen, local_port, e.strerror or e))
 
-    proxy = None
-    close_handler = None
-    if args.system_proxy:
-        proxy = WindowsProxy("127.0.0.1:%d" % local_port)
-        close_handler = on_console_close(proxy.restore)
+    proxy = WindowsProxy("127.0.0.1:%d" % local_port, args.bypass) if args.system_proxy else None
+    redirector = None
+    if args.proxifyre is not None:
+        redirector = ProxiFyre(args.proxifyre or None, local_port)
+        if redirector.available:
+            log("ProxiFyre found; it will run only while the phone is ready.")
+        else:
+            log("ProxiFyre not found at %s; skipping it." % redirector.exe)
+            redirector = None
+    switches = Switches(proxy, redirector)
+    close_handler = on_console_close(switches.off) if (proxy or redirector) else None
 
     log("Forwarding %s:%d -> iPhone:%d over USB. Press Ctrl+C to stop."
         % (args.listen, local_port, args.port))
     if not proxy:
         log("Point your apps at 127.0.0.1:%d (SOCKS5 or HTTP)." % local_port)
     try:
-        await watch(fwd, proxy)
+        await watch(fwd, switches)
     finally:
-        # Restore first, and don't wait for open connections to drain:
+        # Switch off first, and don't wait for open connections to drain:
         # browsers keep idle keep-alive connections open indefinitely.
-        if proxy and proxy.active:
-            proxy.restore()
-            log("Windows proxy OFF (restored your previous settings)")
+        switches.off()
         server.close()
         del close_handler
 
@@ -299,9 +436,15 @@ def main():
     ap.add_argument("--system-proxy", action="store_true",
                     help="turn the Windows system proxy on while the phone is ready, "
                          "and restore the previous settings on exit")
+    ap.add_argument("--bypass", action="append", default=[], metavar="HOST",
+                    help="extra host that skips the proxy, e.g. *.example.com (repeatable). "
+                         "Local addresses always skip it.")
+    ap.add_argument("--proxifyre", nargs="?", const="", metavar="EXE",
+                    help="run ProxiFyre (per-app redirector, e.g. for steam.exe) only while the "
+                         "phone is ready; optional path to ProxiFyre.exe. Needs admin.")
     args = ap.parse_args()
-    if args.system_proxy and sys.platform != "win32":
-        sys.exit("--system-proxy only works on Windows")
+    if (args.system_proxy or args.proxifyre is not None) and sys.platform != "win32":
+        sys.exit("--system-proxy and --proxifyre only work on Windows")
     try:
         asyncio.run(run(args))
     except KeyboardInterrupt:

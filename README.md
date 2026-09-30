@@ -103,6 +103,30 @@ That includes Windows DNS lookups, background updates, and apps that ignore the 
 Windows will show "No internet" on the network icon. That's expected: apps that use the proxy work, and anything that ignores the proxy is blocked instead of leaking.
 To get those other apps working too, point Proxifier or sing-box at `127.0.0.1:8180` (SOCKS5).
 
+### Apps that ignore the Windows proxy (e.g. Steam downloads)
+
+Some apps ignore the Windows proxy setting. Steam's store pages (`steamwebhelper.exe`) follow it, but its login and game downloads (`steam.exe`) connect directly.
+To force a specific program through the phone, use [ProxiFyre](https://github.com/wiresock/proxifyre). It's free and captures one app's connections, whatever the app's own settings say.
+
+1. Install ProxiFyre from its GitHub Releases page (the `win-x64-setup.exe`). It installs a packet-filter driver.
+2. That's all. `Phone Proxy.bat` asks for admin rights and then manages ProxiFyre for you:
+   - The first time it runs, it installs [`pc/proxifyre-app-config.json`](pc/proxifyre-app-config.json), which sends only `steam.exe` over TCP to the phone.
+     If you've edited ProxiFyre's config yourself, it keeps your version.
+   - It runs `ProxiFyre.exe` directly, only while the phone is ready.
+     It stops it when you unplug the phone, stop the app, or close the window, so Steam always has a working connection.
+     It doesn't use ProxiFyre's Windows service, because on some PCs that service times out on start.
+   - ProxiFyre's output is saved to `%TEMP%\proxifyre-console.log`.
+3. Restart Steam after the launcher says `ProxiFyre ON`.
+
+Games themselves (`cs2.exe` etc.) aren't in the list, so they keep home-internet latency.
+Game downloads use the phone's mobile data, so watch your data allowance.
+
+**If Steam downloads crawl at ~250 KB/s while other downloads are fast:** your carrier is throttling Valve's download servers. AT&T does this.
+Turn on **Cloudflare WARP** in the **1.1.1.1** app on the iPhone. That took Steam from ~2 to 117–185 Mbit/s.
+Leave the app's **Only use cellular** off, because it bypasses VPNs. To check that WARP is being used:
+`curl --proxy socks5h://127.0.0.1:8180 https://www.cloudflare.com/cdn-cgi/trace` should show `warp=on`.
+Keep the PC's Wi-Fi on: Steam's name lookups and ProxiFyre's redirection need the home network, even though the downloads go through the phone.
+
 ## 2. Connect the PC (hotspot mode)
 
 The PC has to be on the phone's network. Use one of these:
